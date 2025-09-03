@@ -1,0 +1,832 @@
+<script>
+/**
+ * Versão: 6.6
+ * Responsabilidades:
+ * 1. Roteamento inicial e fluxo de recuperação de senha.
+ * 2. Renderizar o dashboard com KPIs baseados no perfil do usuário.
+ * 3. Gerenciar o novo modal de propostas com cadastro de cliente e escala (com correção).
+ * 4. Gerenciar o modal de salários com cargos não editáveis.
+ * 5. Exibir mini-relatórios redesenhados com colunas extras (Cliente, Status) e totais.
+ * 6. Chamar a nova função de geração de PDF via template para propostas (corrigida).
+ */
+
+let currentUser = null;
+let appDataStore = { postos: [], clientes: [], orcamentoBase: [], baseSalariosConvencao: [] };
+
+// --- INICIALIZAÇÃO DA APLICAÇÃO ---
+document.addEventListener('DOMContentLoaded', () => {
+  lucide.createIcons();
+  initializePage();
+
+  // Bind de eventos globais
+  document.getElementById('login-form')?.addEventListener('submit', handleLogin);
+  document.getElementById('forgot-password-link')?.addEventListener('click', handleForgotPassword);
+  document.getElementById('reset-password-form')?.addEventListener('submit', handleResetPassword);
+  document.getElementById('logout-btn')?.addEventListener('click', handleLogout);
+  document.getElementById('sidebar-toggle-btn')?.addEventListener('click', toggleSidebar);
+  document.getElementById('feedback-close-btn')?.addEventListener('click', hideFeedbackModal);
+});
+
+function initializePage() {
+    if (PAGE_DATA.page === 'reset' && PAGE_DATA.code) {
+        showResetPasswordScreen(PAGE_DATA.code);
+    } else {
+        showLoginScreen();
+        if(PAGE_DATA.message) {
+            showFeedbackModal('success', 'Informação', decodeURIComponent(PAGE_DATA.message.replace(/\+/g, ' ')));
+        }
+    }
+}
+
+// --- FUNÇÕES DE FEEDBACK E MODAIS GLOBAIS ---
+function showProcessingModal(message = 'Processando, por favor aguarde...') {
+    const icon = `<i data-lucide="loader" class="w-16 h-16 text-brand-blue animate-spin"></i>`;
+    document.getElementById('feedback-icon-container').innerHTML = icon;
+    document.getElementById('feedback-title').textContent = 'Aguarde';
+    document.getElementById('feedback-message').textContent = message;
+    document.getElementById('feedback-close-btn').classList.add('hidden');
+    document.getElementById('feedback-modal').classList.remove('hidden');
+    lucide.createIcons();
+}
+
+function showFeedbackModal(type, title, message) {
+    const isSuccess = type === 'success';
+    const icon = isSuccess 
+        ? `<i data-lucide="check-circle" class="w-16 h-16 text-green-500"></i>` 
+        : `<i data-lucide="alert-circle" class="w-16 h-16 text-red-500"></i>`;
+    
+    document.getElementById('feedback-icon-container').innerHTML = icon;
+    document.getElementById('feedback-title').textContent = title;
+    document.getElementById('feedback-message').textContent = message;
+    const closeBtn = document.getElementById('feedback-close-btn');
+    closeBtn.className = `font-bold py-2 px-6 rounded-lg text-white ${isSuccess ? 'bg-green-500' : 'bg-red-500'}`;
+    closeBtn.classList.remove('hidden');
+    document.getElementById('feedback-modal').classList.remove('hidden');
+    lucide.createIcons();
+}
+
+function hideFeedbackModal() {
+    document.getElementById('feedback-modal').classList.add('hidden');
+}
+
+function closeModal() { 
+    document.getElementById('app-modal').classList.add('hidden');
+}
+
+// --- CONTROLE DE TELAS PRINCIPAIS (LOGIN, RESET, APP) ---
+function showLoginScreen() {
+    document.getElementById('intranet-main').classList.add('hidden');
+    document.getElementById('reset-password-screen').classList.add('hidden');
+    document.getElementById('login-screen').classList.add('flex');
+    document.getElementById('login-screen').classList.remove('hidden');
+    
+    const savedEmail = localStorage.getItem('rememberedEmail');
+    if (savedEmail) {
+        document.getElementById('email').value = savedEmail;
+        document.getElementById('remember-me').checked = true;
+    }
+}
+
+function showResetPasswordScreen(code) {
+    document.getElementById('intranet-main').classList.add('hidden');
+    document.getElementById('login-screen').classList.add('hidden');
+    document.getElementById('reset-password-screen').classList.add('flex');
+    document.getElementById('reset-password-screen').classList.remove('hidden');
+    document.getElementById('reset-code').value = code;
+}
+
+function showIntranet() {
+    document.getElementById('login-screen').classList.add('hidden');
+    document.getElementById('reset-password-screen').classList.add('hidden');
+    document.getElementById('intranet-main').classList.remove('hidden');
+}
+
+// --- LÓGICA DE LOGIN E LOGOUT ---
+function handleLogin(e) {
+  e.preventDefault();
+  showProcessingModal('Verificando credenciais...');
+  const email = document.getElementById('email').value;
+  const password = document.getElementById('password').value;
+  const rememberMe = document.getElementById('remember-me').checked;
+  if (rememberMe) localStorage.setItem('rememberedEmail', email); else localStorage.removeItem('rememberedEmail');
+  google.script.run.withSuccessHandler(onLoginSuccess).withFailureHandler(onLoginFailure).checkUserCredentials(email, password);
+}
+
+function onLoginSuccess(user) {
+  hideFeedbackModal();
+  if (user && user.role) {
+    currentUser = user;
+    setupUserProfile(user);
+    setupSidebarNavigation(user.role);
+    showIntranet();
+    navigateTo('dashboard');
+  } else {
+    showFeedbackModal('error', 'Falha no Login', user ? user.error : 'Credenciais inválidas. Verifique seu e-mail e senha.');
+  }
+}
+
+function onLoginFailure(error) {
+  showFeedbackModal('error', 'Erro de Comunicação', error.message);
+}
+
+function handleLogout(e) {
+  e.preventDefault();
+  currentUser = null;
+  showLoginScreen();
+  document.getElementById('main-content-area').innerHTML = '';
+  document.getElementById('sidebar-nav').innerHTML = '';
+}
+
+// --- LÓGICA DE RECUPERAÇÃO DE SENHA ---
+function handleForgotPassword(e) {
+    e.preventDefault();
+    const email = prompt("Digite seu e-mail para receber o link de redefinição de senha:");
+    if (email) {
+        showProcessingModal('Enviando link de redefinição...');
+        google.script.run
+            .withSuccessHandler(res => {
+                if(res.success) showFeedbackModal('success', 'Verifique seu E-mail', res.message);
+                else showFeedbackModal('error', 'Erro', res.message);
+            })
+            .withFailureHandler(onLoginFailure)
+            .requestPasswordReset(email);
+    }
+}
+
+function handleResetPassword(e) {
+    e.preventDefault();
+    const code = document.getElementById('reset-code').value;
+    const newPassword = document.getElementById('new-password').value;
+    const confirmPassword = document.getElementById('confirm-password').value;
+    if (newPassword !== confirmPassword) {
+        showFeedbackModal('error', 'Erro', 'As senhas não coincidem.');
+        return;
+    }
+    if (newPassword.length < 6) {
+        showFeedbackModal('error', 'Erro', 'A senha deve ter pelo menos 6 caracteres.');
+        return;
+    }
+
+    showProcessingModal('Redefinindo sua senha...');
+    google.script.run
+        .withSuccessHandler(res => {
+            if(res.success) {
+                google.script.run.withSuccessHandler(url => {
+                    window.location.href = url + '?message=' + encodeURIComponent(res.message);
+                }).getScriptUrl();
+            } else {
+                showFeedbackModal('error', 'Falha na Redefinição', res.message);
+            }
+        })
+        .withFailureHandler(onLoginFailure)
+        .resetPasswordWithCode(code, newPassword);
+}
+
+// --- NAVEGAÇÃO E RENDERIZAÇÃO DA INTRANET ---
+function toggleSidebar() { document.body.classList.toggle('sidebar-collapsed'); }
+
+function setupUserProfile(user) {
+  document.getElementById('user-name').textContent = user.name;
+  document.getElementById('user-role').textContent = user.role;
+  document.getElementById('user-avatar').src = user.avatar;
+}
+
+function setupSidebarNavigation(role) {
+  const navContainer = document.getElementById('sidebar-nav');
+  navContainer.innerHTML = '';
+  
+  const menuStructure = [
+    { id: 'dashboard', label: 'Dashboard', icon: 'layout-dashboard', roles: ['Diretor', 'Gestor', 'Financeiro', 'RH'] },
+    { id: 'operacoes', label: 'Operações', icon: 'clipboard-list', roles: ['Diretor', 'Gestor'],
+      submenu: [ { id: 'op-relatorios', label: 'Relatórios' } ]
+    },
+    { id: 'financeiro', label: 'Financeiro', icon: 'dollar-sign', roles: ['Diretor', 'Gestor', 'Financeiro'],
+      submenu: [ { id: 'fin-relatorios', label: 'Relatórios' } ]
+    },
+    { id: 'rh', label: 'RH', icon: 'users', roles: ['Diretor', 'Gestor', 'RH'],
+      submenu: [ { id: 'rh-relatorios', label: 'Relatórios' } ]
+    },
+    { id: 'relatorios', label: 'Relatórios Gerais', icon: 'file-pie-chart', roles: ['Diretor'] }
+  ];
+
+  menuStructure.forEach(item => {
+    if (item.roles.includes(role)) {
+      const hasSubmenu = item.submenu && item.submenu.length > 0;
+      const navItem = document.createElement('div');
+      navItem.className = 'nav-item';
+      
+      const link = document.createElement('a');
+      link.href = `#${item.id}`;
+      link.className = 'sidebar-link';
+      link.innerHTML = `<div><i data-lucide="${item.icon}"></i><span class="link-text">${item.label}</span></div> ${hasSubmenu ? '<i data-lucide="chevron-down" class="submenu-toggle link-text"></i>' : ''}`;
+      
+      link.onclick = (e) => { 
+        e.preventDefault();
+        if (hasSubmenu) {
+          navItem.classList.toggle('open');
+        } else {
+          navigateTo(item.id); 
+        }
+      };
+      
+      navItem.appendChild(link);
+
+      if (hasSubmenu) {
+        const submenuContainer = document.createElement('div');
+        submenuContainer.className = 'submenu';
+        item.submenu.forEach(subItem => {
+          const subLink = document.createElement('a');
+          subLink.href = `#${subItem.id}`;
+          subLink.className = 'submenu-link';
+          subLink.innerHTML = `<span class="link-text">${subItem.label}</span>`;
+          subLink.onclick = (e) => { e.preventDefault(); navigateTo(subItem.id); };
+          submenuContainer.appendChild(subLink);
+        });
+        navItem.appendChild(submenuContainer);
+      }
+      navContainer.appendChild(navItem);
+    }
+  });
+  lucide.createIcons();
+}
+
+function navigateTo(pageId) {
+  const mainContentArea = document.getElementById('main-content-area');
+  document.querySelectorAll('.sidebar-link, .submenu-link').forEach(link => link.classList.remove('active'));
+  const activeLink = document.querySelector(`a[href="#${pageId}"]`);
+  if(activeLink) activeLink.classList.add('active');
+
+  mainContentArea.innerHTML = `<div class="text-center p-10"><i data-lucide="loader" class="animate-spin text-brand-blue h-12 w-12"></i></div>`;
+  lucide.createIcons();
+  
+  if (pageId === 'dashboard') {
+      renderDashboardPage(mainContentArea);
+  } else if (pageId === 'relatorios' || pageId.endsWith('-relatorios')) {
+      renderReportsPage(mainContentArea, pageId);
+  } else {
+      mainContentArea.innerHTML = `<h1 class="text-4xl font-extrabold text-brand-blue mb-6">Página '${pageId}' em Construção</h1>`;
+  }
+}
+
+function renderDashboardPage(container) {
+  const meses = ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"];
+  const currentMonth = meses[new Date().getMonth()];
+  const currentYear = new Date().getFullYear();
+
+  const mesOptions = meses.map(m => `<option value="${m}" ${m === currentMonth ? 'selected' : ''}>${m}</option>`).join('');
+  
+  container.innerHTML = `
+    <div class="flex justify-between items-center mb-4 flex-wrap gap-4">
+        <h1 class="text-4xl font-extrabold text-brand-blue">Dashboard</h1>
+        <div class="flex items-center gap-2 bg-white p-2 rounded-lg shadow">
+            <select id="mes-filter" class="border p-1 rounded-md">${mesOptions}</select>
+            <input type="number" id="ano-filter" class="border p-1 rounded-md w-24" value="${currentYear}">
+            <button id="btn-apply-filter" class="bg-brand-blue text-white p-2 rounded-md hover:bg-opacity-90" title="Aplicar Filtro"><i data-lucide="filter"></i></button>
+        </div>
+    </div>
+    <div id="dashboard-actions" class="flex flex-wrap gap-4 items-center mb-8"></div>
+    <div id="kpi-grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6"></div>`;
+
+  const actionsContainer = document.getElementById('dashboard-actions');
+  actionsContainer.innerHTML = `<button id="btn-refresh" class="text-gray-500 hover:text-brand-blue" title="Atualizar Dados"><i data-lucide="refresh-cw"></i></button>`;
+  document.getElementById('btn-refresh').addEventListener('click', () => fetchDashboardData());
+  document.getElementById('btn-apply-filter').addEventListener('click', () => fetchDashboardData());
+
+  if (currentUser.role === 'Diretor' || currentUser.role === 'Gestor') {
+    actionsContainer.insertAdjacentHTML('beforeend', `
+        <button id="btn-lancar-previsao" class="bg-brand-orange text-white font-bold py-2 px-4 rounded-lg flex items-center gap-2 hover:bg-opacity-90"><i data-lucide="plus-circle"></i> Lançar Previsão</button>
+        <button id="btn-base-salarios" class="bg-indigo-600 text-white font-bold py-2 px-4 rounded-lg flex items-center gap-2 hover:bg-opacity-90"><i data-lucide="database"></i> Base Salários</button>
+        <button id="btn-nova-proposta" class="bg-brand-blue text-white font-bold py-2 px-4 rounded-lg flex items-center gap-2 hover:bg-opacity-90"><i data-lucide="file-plus-2"></i> Proposta para Orçamento</button>`);
+    
+    document.getElementById('btn-lancar-previsao').addEventListener('click', openPrevisaoModal);
+    document.getElementById('btn-base-salarios').addEventListener('click', openBaseSalariosModal);
+    document.getElementById('btn-nova-proposta').addEventListener('click', openPropostaOrcamentoModal);
+  }
+  lucide.createIcons();
+  fetchDashboardData();
+  google.script.run.withSuccessHandler(data => {
+      if(data.error) showFeedbackModal('error', 'Erro Crítico', "Não foi possível carregar os dados iniciais: " + data.error)
+      else appDataStore = data;
+  }).getInitialData();
+}
+
+function renderReportsPage(container, pageId) {
+    const title = pageId.replace('-', ' ').replace(/\b\w/g, l => l.toUpperCase());
+    container.innerHTML = `<h1 class="text-4xl font-extrabold text-brand-blue mb-6">Página de Relatórios - ${title}</h1><p>Esta área exibirá os relatórios específicos para o setor selecionado.</p>`;
+}
+
+function fetchDashboardData(){
+    const periodo = {
+        mes: document.getElementById('mes-filter').value,
+        ano: document.getElementById('ano-filter').value
+    };
+    if (!periodo.mes || !periodo.ano) {
+        showFeedbackModal('error', 'Filtro Inválido', 'Por favor, selecione o mês e o ano.');
+        return;
+    }
+    const kpiGrid = document.getElementById('kpi-grid');
+    kpiGrid.innerHTML = `<div class="col-span-full text-center p-10"><i data-lucide="loader" class="animate-spin text-brand-blue h-12 w-12"></i></div>`;
+    lucide.createIcons();
+    google.script.run.withSuccessHandler(updateDashboardKPIs).withFailureHandler(err => showFeedbackModal('error', "Erro ao buscar dados", err.message)).getDashboardData(periodo);
+}
+
+function updateDashboardKPIs(data) {
+  if (data.error) { showFeedbackModal('error', 'Erro no Dashboard', data.error); document.getElementById('kpi-grid').innerHTML = ''; return; }
+  const kpiGrid = document.getElementById('kpi-grid');
+  kpiGrid.innerHTML = '';
+  
+  const allKpis = [
+      { id: 'previaFaturamento', title: 'PRÉVIA DE FATURAMENTO', value: data.previaFaturamento, secondaryValue: '', icon: 'file-text', color: 'blue', roles: ['Diretor', 'Gestor'] },
+      { id: 'faturamento', title: 'FATURAMENTO TOTAL', value: data.faturamentoBruto, secondaryValue: 'Líquido: ' + data.faturamentoLiquido, icon: 'dollar-sign', color: 'green', roles: ['Diretor', 'Gestor'] },
+      { id: 'contasAReceber', title: 'CONTAS A RECEBER', value: data.totalAReceber, secondaryValue: 'Recebido: ' + data.totalRecebido, icon: 'arrow-down-circle', color: 'orange', roles: ['Diretor', 'Gestor', 'Financeiro'] },
+      { id: 'totalAPagar', title: 'CONTAS A PAGAR', value: data.totalAPagar, secondaryValue: 'Pago: ' + data.totalPago, icon: 'arrow-up-circle', color: 'red', roles: ['Diretor', 'Gestor', 'Financeiro'] },
+  ];
+
+  const userKpis = allKpis.filter(kpi => kpi.roles.includes(currentUser.role));
+
+  userKpis.forEach(kpi => {
+      const kpiHtml = `
+      <div class="kpi-card-final" onclick="openKpiReportModal('${kpi.id}', '${kpi.title}')">
+        <div class="kpi-icon-wrapper bg-icon-${kpi.color}">
+          <i data-lucide="${kpi.icon}"></i>
+        </div>
+        <div class="kpi-content">
+          <p class="kpi-title-final">${kpi.title}</p>
+          <p class="kpi-value-main">${kpi.value}</p>
+          <p class="kpi-value-secondary">${kpi.secondaryValue}</p>
+        </div>
+      </div>`;
+    kpiGrid.innerHTML += kpiHtml;
+  });
+  lucide.createIcons();
+}
+
+// --- MODAL MINI-RELATÓRIO KPI ---
+function openKpiReportModal(kpiId, kpiLabel) {
+    const periodo = { mes: document.getElementById('mes-filter').value, ano: document.getElementById('ano-filter').value };
+    const modalContent = document.getElementById('modal-content');
+    modalContent.innerHTML = `<div class="p-6 text-center relative"><i data-lucide="loader" class="animate-spin mx-auto text-brand-blue h-12 w-12"></i><p>Carregando relatório...</p><button onclick="closeModal()" class="absolute top-2 right-4 text-gray-500 text-3xl hover:text-black">&times;</button></div>`;
+    lucide.createIcons();
+    document.getElementById('app-modal').classList.remove('hidden');
+    google.script.run.withSuccessHandler(data => renderKpiReport(data, kpiLabel, periodo)).withFailureHandler(err => showFeedbackModal('error', 'Erro ao carregar relatório', err.message)).getKpiDetails(kpiId, periodo);
+}
+
+function renderKpiReport(data, kpiLabel, periodo) {
+    if (data.error) { closeModal(); showFeedbackModal('error', 'Erro no Relatório', data.error); return; }
+    
+    let tableRowsHtml = '';
+    let totalBruto = 0;
+    let totalLiquido = 0;
+    
+    const hasStatus = kpiLabel.includes('PAGAR') || kpiLabel.includes('RECEBER');
+    let targetHeaders = ['Mês', 'Ano', 'Cliente/Posto', 'Descrição', 'Total Bruto', 'Total Líquido'];
+    if (hasStatus) {
+        targetHeaders.splice(4, 0, 'Status');
+    }
+
+    if(data.data && data.data.length > 0) {
+        const headers = data.headers;
+        const findIndex = (possibleNames) => {
+            for(const name of possibleNames) {
+                const index = headers.indexOf(name);
+                if (index !== -1) return index;
+            }
+            return -1;
+        };
+
+        const colMap = {
+            mes: findIndex(['MES']),
+            ano: findIndex(['ANO']),
+            descricao: findIndex(['DESCRICAO', 'Descricao', 'descrição']),
+            cliente: findIndex(['Cliente', 'Posto', 'Fornecedor']),
+            status: findIndex(['STATUS_PAGAMENTO', 'Status']),
+            bruto: findIndex(['Valor_Bruto', 'VALOR', 'VALOR_TOTAL']),
+            liquido: findIndex(['Valor_Liquido']),
+        };
+
+        tableRowsHtml = data.data.map(row => {
+            const bruto = colMap.bruto !== -1 && row[colMap.bruto] ? parseCurrency(row[colMap.bruto]) : 0;
+            const liquido = colMap.liquido !== -1 && row[colMap.liquido] ? parseCurrency(row[colMap.liquido]) : bruto;
+            totalBruto += bruto;
+            totalLiquido += liquido;
+
+            const clientePosto = row[colMap.cliente] || 'N/A';
+            const descricaoText = row[colMap.descricao] || 'N/A';
+            const statusText = hasStatus ? (row[colMap.status] || 'N/A') : '';
+            
+            let rowHtml = `<tr>
+                <td>${colMap.mes !== -1 ? row[colMap.mes] : ''}</td>
+                <td>${colMap.ano !== -1 ? row[colMap.ano] : ''}</td>
+                <td>${clientePosto}</td>
+                <td>${descricaoText}</td>`;
+
+            if(hasStatus) rowHtml += `<td>${statusText}</td>`;
+
+            rowHtml += `<td>${formatToBRL(bruto)}</td>
+                <td>${formatToBRL(liquido)}</td>
+            </tr>`;
+            return rowHtml;
+        }).join('');
+    }
+
+    const footerColspan = hasStatus ? 5 : 4;
+    const tableHtml = `<div class="overflow-x-auto"><table id="report-table" class="min-w-full divide-y divide-gray-200"><thead><tr>${targetHeaders.map(h => `<th>${h}</th>`).join('')}</tr></thead><tbody>${tableRowsHtml}</tbody><tfoot><tr class="font-bold bg-gray-100"><td colspan="${footerColspan}" class="text-right">TOTAIS</td><td>${formatToBRL(totalBruto)}</td><td>${formatToBRL(totalLiquido)}</td></tr></tfoot></table></div>`;
+    
+    document.getElementById('modal-content').innerHTML = `
+        <div class="p-6">
+            <div class="flex justify-between items-center mb-4">
+                <h3 class="text-xl font-bold">${kpiLabel}</h3>
+                <div class="flex items-center">
+                    <button id="btn-print-report" class="bg-gray-600 text-white font-bold py-2 px-4 rounded-lg flex items-center gap-2 hover:bg-opacity-90"><i data-lucide="printer"></i> Imprimir</button>
+                    <button onclick="closeModal()" class="text-3xl hover:text-red-500 ml-4">&times;</button>
+                </div>
+            </div>
+            ${tableRowsHtml ? tableHtml : '<p class="text-center text-gray-500">Não há dados para exibir no período selecionado.</p>'}
+        </div>`;
+    
+    const printBtn = document.getElementById('btn-print-report');
+    if(printBtn) {
+        printBtn.addEventListener('click', () => {
+            const tableElement = document.getElementById('report-table');
+            if(!tableElement) return;
+
+            const headers = Array.from(tableElement.querySelectorAll('thead th')).map(th => th.innerText);
+            const rows = Array.from(tableElement.querySelectorAll('tbody tr, tfoot tr')).map(tr => Array.from(tr.querySelectorAll('td')).map(td => td.innerText));
+            
+            const reportData = {
+                title: kpiLabel,
+                period: `${periodo.mes}/${periodo.ano}`,
+                headers: headers,
+                rows: rows,
+                userRole: currentUser.role
+            };
+            showProcessingModal('Gerando PDF do relatório...');
+            google.script.run.withSuccessHandler(res => {
+                if(res.success) {
+                    hideFeedbackModal();
+                    window.open(res.url, '_blank');
+                } else {
+                    showFeedbackModal('error', 'Erro ao Imprimir', res.message);
+                }
+            }).withFailureHandler(onLoginFailure).generateMiniReportPdf(reportData);
+        });
+    }
+    lucide.createIcons();
+}
+
+// --- MODAL DE LANÇAR PREVISÃO ---
+function openPrevisaoModal() {
+    const meses = ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"];
+    const mesesOptions = meses.map((mes, i) => `<option value="${mes}" ${i === new Date().getMonth() ? 'selected' : ''}>${mes}</option>`).join('');
+    
+    const modalContent = document.getElementById('modal-content');
+    modalContent.innerHTML = `<div class="p-6"><div class="flex justify-between items-center mb-4"><h3 class="text-xl font-bold text-brand-blue">Lançar Previsão de Faturamento</h3><button onclick="closeModal()" class="text-3xl hover:text-red-500">&times;</button></div><form id="previsao-form"><div class="space-y-4"><div><label>Posto</label><select id="previsao-posto" class="w-full mt-1 p-2 border rounded-lg"><option value="">Selecione um Posto...</option>${appDataStore.postos.map(p => `<option value="${p.ID}">${p.NOME}</option>`).join('')}</select></div><div class="grid grid-cols-1 md:grid-cols-2 gap-4"><div><label>Mês</label><select id="previsao-mes" required class="w-full mt-1 p-2 border rounded-lg">${mesesOptions}</select></div><div><label>Ano</label><input type="number" id="previsao-ano" value="${new Date().getFullYear()}" required class="w-full mt-1 p-2 border rounded-lg"></div></div><div><label>Valor Bruto (R$)</label><input type="text" id="previsao-valor-bruto" required class="w-full mt-1 p-2 border rounded-lg" placeholder="R$ 0,00"></div><div><label>Descrição</label><textarea id="previsao-descricao" rows="3" class="w-full mt-1 p-2 border rounded-lg"></textarea></div></div><div class="mt-6 flex justify-end gap-4"><button type="button" onclick="closeModal()" class="bg-gray-200 text-gray-700 font-bold py-2 px-4 rounded-lg">Cancelar</button><button type="submit" class="bg-brand-blue text-white font-bold py-2 px-4 rounded-lg">Salvar</button></div></form></div>`;
+    document.getElementById('app-modal').classList.remove('hidden');
+    document.getElementById('previsao-form').addEventListener('submit', handlePrevisaoSubmit);
+    document.getElementById('previsao-valor-bruto').addEventListener('input', formatCurrency);
+}
+
+function handlePrevisaoSubmit(e) {
+    e.preventDefault();
+    const postoSelect = document.getElementById('previsao-posto');
+    if (!postoSelect.value) { showFeedbackModal('error', 'Campo Obrigatório', 'Por favor, selecione um posto.'); return; }
+    
+    const formData = { 
+        mes: document.getElementById('previsao-mes').value, 
+        ano: document.getElementById('previsao-ano').value, 
+        postoNome: postoSelect.options[postoSelect.selectedIndex].text,
+        valorBruto: parseCurrency(document.getElementById('previsao-valor-bruto').value),
+        descricao: document.getElementById('previsao-descricao').value 
+    };
+    
+    showProcessingModal('Salvando previsão...');
+    google.script.run.withSuccessHandler(res => { 
+        if(res.success) {
+            closeModal();
+            showFeedbackModal('success', 'Sucesso', res.message);
+            fetchDashboardData();
+        } else {
+            showFeedbackModal('error', 'Erro ao Salvar', res.message);
+        }
+    }).withFailureHandler(onLoginFailure).addFaturamentoPrevisao(formData, currentUser.name);
+}
+
+// --- MODAL BASE SALÁRIOS CONVENÇÃO ---
+function openBaseSalariosModal() {
+    const modalContent = document.getElementById('modal-content');
+    modalContent.innerHTML = `
+    <div class="p-6">
+        <div class="flex justify-between items-center mb-6"><h3 class="text-2xl font-bold text-brand-blue">Ajuste de Salários Convenção</h3><button onclick="closeModal()" class="text-3xl hover:text-red-500">&times;</button></div>
+        <div id="base-salarios-table-container" class="border rounded-lg">
+            <div class="grid grid-cols-12 gap-4 bg-gray-100 p-3 font-bold text-sm text-gray-600 rounded-t-lg items-center">
+                <div class="col-span-1 text-center"><input type="checkbox" id="select-all-cargos" title="Selecionar Todos"></div>
+                <div class="col-span-5">Cargo</div><div class="col-span-2">Salário Atual</div><div class="col-span-1">%</div><div class="col-span-2">Novo Salário</div><div class="col-span-1 text-center">Aplicar</div>
+            </div>
+            <div id="base-salarios-items" class="p-2 max-h-80 overflow-y-auto">
+                ${appDataStore.baseSalariosConvencao.map(renderBaseSalarioRow).join('')}
+            </div>
+            <div id="new-cargo-container" class="p-2 border-t"></div>
+        </div>
+        <div class="mt-4 flex justify-between items-center">
+            <button id="btn-add-new-cargo-row" class="text-sm text-green-600 hover:underline flex items-center gap-1"><i data-lucide="plus"></i> Adicionar Novo Cargo</button>
+        </div>
+        <div class="mt-4 p-4 border rounded-lg bg-gray-50 flex items-end gap-4">
+            <div class="flex-grow"><label>Aplicar Reajuste Percentual (%) em Massa</label><input type="number" step="0.1" id="percent-reajuste-global" class="w-full p-2 mt-1 border rounded-lg" placeholder="Ex: 5.5"></div>
+            <button id="btn-aplicar-reajuste-massa" class="bg-blue-600 text-white font-bold py-2 px-4 rounded-lg">Aplicar nos Selecionados</button>
+            <button id="btn-remover-selecionados" class="bg-red-600 text-white font-bold py-2 px-4 rounded-lg" title="Remover selecionados da tela de ajuste"><i data-lucide="trash-2"></i></button>
+        </div>
+        <div class="mt-6 flex justify-end gap-4">
+            <button type="button" onclick="closeModal()" class="bg-gray-200 text-gray-700 font-bold py-2 px-4 rounded-lg">Cancelar</button>
+            <button type="button" id="btn-save-base-salarios" class="bg-brand-blue text-white font-bold py-2 px-4 rounded-lg">Salvar Alterações</button>
+        </div>
+    </div>`;
+    
+    document.getElementById('app-modal').classList.remove('hidden');
+    lucide.createIcons();
+    document.getElementById('select-all-cargos').addEventListener('change', (e) => {
+        document.querySelectorAll('.cargo-checkbox').forEach(cb => cb.checked = e.target.checked);
+    });
+    document.getElementById('btn-add-new-cargo-row').addEventListener('click', appendNewCargoRow);
+    document.getElementById('btn-aplicar-reajuste-massa').addEventListener('click', handleAplicarReajusteMassa);
+    document.getElementById('btn-remover-selecionados').addEventListener('click', handleRemoverSelecionados);
+    document.getElementById('btn-save-base-salarios').addEventListener('click', handleSaveBaseSalarios);
+    document.querySelectorAll('.base-salario-row').forEach(bindRowEvents);
+}
+
+function renderBaseSalarioRow(cargo) {
+    const id = cargo.id || 'new-' + Date.now();
+    const nome = cargo.funcao || '';
+    const salario = cargo.salario || 0;
+    return `
+    <div class="grid grid-cols-12 items-center gap-4 py-1 base-salario-row" data-id="${id}">
+        <div class="col-span-1 text-center"><input type="checkbox" class="cargo-checkbox"></div>
+        <div class="col-span-5"><input type="text" value="${nome}" class="w-full p-1 border rounded-lg text-sm cargo-nome bg-gray-100" disabled></div>
+        <div class="col-span-2"><input type="text" value="${formatToBRL(salario)}" class="w-full p-1 border rounded-lg text-sm salario-atual bg-gray-100" disabled></div>
+        <div class="col-span-1"><input type="number" step="0.1" class="w-full p-1 border rounded-lg text-sm percent-individual" placeholder="0"></div>
+        <div class="col-span-2"><input type="text" value="${formatToBRL(salario)}" class="w-full p-1 border rounded-lg text-sm novo-salario bg-gray-100" disabled></div>
+        <div class="col-span-1 text-center"><button class="text-gray-500 hover:text-green-600 btn-apply-individual" title="Aplicar este reajuste"><i data-lucide="check"></i></button></div>
+    </div>`;
+}
+
+function bindRowEvents(row) {
+    const salarioAtualInput = row.querySelector('.salario-atual');
+    const percentInput = row.querySelector('.percent-individual');
+    const novoSalarioInput = row.querySelector('.novo-salario');
+
+    const calculateNewSalary = () => {
+        const salarioAtual = parseCurrency(salarioAtualInput.value);
+        const percent = parseFloat(percentInput.value) || 0;
+        novoSalarioInput.value = formatToBRL(salarioAtual * (1 + percent / 100));
+    };
+    
+    percentInput.addEventListener('input', calculateNewSalary);
+    row.querySelector('.btn-apply-individual').addEventListener('click', () => {
+        salarioAtualInput.value = novoSalarioInput.value;
+        percentInput.value = '';
+    });
+    lucide.createIcons();
+}
+
+function appendNewCargoRow() {
+    const container = document.getElementById('new-cargo-container');
+    if (container.querySelector('.new-cargo-row')) return;
+    
+    const newRowId = `new-cargo-${Date.now()}`;
+    container.innerHTML = `
+    <div class="grid grid-cols-12 items-center gap-4 py-1 bg-green-50 p-2 rounded new-cargo-row" id="${newRowId}">
+        <div class="col-span-1"></div>
+        <div class="col-span-5"><input type="text" placeholder="Nome do Novo Cargo" class="w-full p-1 border rounded-lg text-sm new-cargo-nome"></div>
+        <div class="col-span-3"><input type="text" placeholder="Salário Inicial" class="w-full p-1 border rounded-lg text-sm new-cargo-salario"></div>
+        <div class="col-span-3 text-right"><button class="bg-green-600 text-white font-bold py-1 px-3 rounded-lg text-sm btn-save-new-cargo">Salvar Cargo</button></div>
+    </div>`;
+    
+    const newRowElement = document.getElementById(newRowId);
+    newRowElement.querySelector('.new-cargo-salario').addEventListener('input', formatCurrency);
+    newRowElement.querySelector('.btn-save-new-cargo').addEventListener('click', handleSaveNewCargo);
+}
+
+function handleSaveNewCargo(e) {
+    const row = e.target.closest('div.new-cargo-row');
+    const nomeInput = row.querySelector('.new-cargo-nome');
+    const salarioInput = row.querySelector('.new-cargo-salario');
+    const cargoData = {
+        nome: nomeInput.value,
+        salario: parseCurrency(salarioInput.value)
+    };
+    if (!cargoData.nome || !cargoData.salario) {
+        showFeedbackModal('error', 'Campos Obrigatórios', 'Nome e Salário são obrigatórios para o novo cargo.');
+        return;
+    }
+    showProcessingModal('Adicionando novo cargo...');
+    google.script.run.withSuccessHandler(res => {
+        if(res.success) {
+            appDataStore.baseSalariosConvencao.push(res.newCargo);
+            row.remove();
+            document.getElementById('base-salarios-items').insertAdjacentHTML('beforeend', renderBaseSalarioRow(res.newCargo));
+            bindRowEvents(document.getElementById('base-salarios-items').lastElementChild);
+            showFeedbackModal('success', 'Sucesso', res.message);
+        } else {
+            showFeedbackModal('error', 'Erro', res.message);
+        }
+    }).withFailureHandler(onLoginFailure).addNewBaseSalario(cargoData);
+}
+
+function handleAplicarReajusteMassa() {
+    const percent = parseFloat(document.getElementById('percent-reajuste-global').value) || 0;
+    if (percent === 0) return;
+    document.querySelectorAll('.cargo-checkbox:checked').forEach(cb => {
+        const row = cb.closest('.base-salario-row');
+        const salarioAtualInput = row.querySelector('.salario-atual');
+        const novoSalarioInput = row.querySelector('.novo-salario');
+        const salarioAtual = parseCurrency(salarioAtualInput.value);
+        const novoSalario = salarioAtual * (1 + percent / 100);
+        novoSalarioInput.value = formatToBRL(novoSalario);
+        salarioAtualInput.value = formatToBRL(novoSalario);
+    });
+    document.getElementById('percent-reajuste-global').value = '';
+}
+
+function handleRemoverSelecionados() {
+    if(!confirm("Tem certeza que deseja remover os cargos selecionados desta tela de ajuste? Eles não serão alterados ao salvar.")) return;
+    document.querySelectorAll('.cargo-checkbox:checked').forEach(cb => {
+        cb.closest('.base-salario-row').remove();
+    });
+}
+
+function handleSaveBaseSalarios() {
+    showProcessingModal('Salvando alterações...');
+    const cargos = Array.from(document.querySelectorAll('.base-salario-row')).map(row => {
+        return { 
+            id: row.dataset.id, 
+            nome: row.querySelector('.cargo-nome').value, 
+            salario: parseCurrency(row.querySelector('.salario-atual').value) 
+        };
+    }).filter(c => c.nome);
+
+    google.script.run
+        .withSuccessHandler(res => {
+            if (res.success) {
+                closeModal();
+                showFeedbackModal('success', 'Sucesso', res.message);
+                navigateTo('dashboard');
+            } else { showFeedbackModal('error', 'Erro ao Salvar', res.message); }
+        })
+        .withFailureHandler(err => showFeedbackModal('error', 'Erro de Comunicação', err.message))
+        .updateBaseSalariosConvencao(cargos);
+}
+
+// --- MODAL PROPOSTA PARA ORÇAMENTO ---
+function openPropostaOrcamentoModal() {
+    const modalContent = document.getElementById('modal-content');
+    modalContent.innerHTML = `
+    <div class="p-6">
+        <div class="flex justify-between items-center mb-6"><h3 class="text-2xl font-bold text-brand-blue">Proposta para Orçamento</h3><button onclick="closeModal()" class="text-3xl hover:text-red-500">&times;</button></div>
+        <div class="space-y-6">
+            <div class="flex items-end gap-4">
+                <div class="flex-grow"><label class="block text-sm font-medium text-gray-700 mb-1">Cliente</label><select id="proposta-cliente-select" class="w-full p-2 border rounded-lg"><option value="">Selecione um cliente...</option>${appDataStore.clientes.map(c => `<option value='${JSON.stringify(c)}'>${c.RAZAO_SOCIAL}</option>`).join('')}</select></div>
+                <button id="btn-add-new-client" class="bg-green-600 text-white font-bold py-2 px-4 rounded-lg flex items-center gap-2 hover:bg-opacity-90 h-10" title="Cadastrar Novo Cliente"><i data-lucide="user-plus"></i></button>
+            </div>
+            <div id="proposta-items-container" class="border rounded-lg">
+                <div class="grid grid-cols-12 gap-4 bg-gray-100 p-3 font-bold text-sm text-gray-600 rounded-t-lg">
+                    <div class="col-span-4">Cargo</div><div class="col-span-2">Escala</div><div class="col-span-1">Qtd</div><div class="col-span-2">Valor Unit.</div><div class="col-span-3 text-right">Valor Mensal</div>
+                </div>
+                <div id="proposta-items" class="p-2 max-h-72 overflow-y-auto"></div>
+                <div class="p-4 flex justify-between items-center border-t">
+                    <div><button id="btn-add-proposta-row" class="text-sm text-brand-blue hover:underline flex items-center gap-1"><i data-lucide="plus"></i> Adicionar Linha</button></div>
+                    <div class="font-bold text-xl text-brand-blue">Total: <span id="proposta-total">R$ 0,00</span></div>
+                </div>
+            </div>
+        </div>
+        <div class="mt-6 flex justify-end gap-4">
+            <button type="button" onclick="closeModal()" class="bg-gray-200 text-gray-700 font-bold py-2 px-4 rounded-lg">Cancelar</button>
+            <button type="button" id="btn-gerar-proposta" class="bg-brand-blue text-white font-bold py-2 px-4 rounded-lg">Gerar Proposta</button>
+        </div>
+    </div>`;
+    
+    document.getElementById('app-modal').classList.remove('hidden');
+    lucide.createIcons();
+    document.getElementById('btn-add-proposta-row').addEventListener('click', addPropostaItemRow);
+    document.getElementById('btn-add-new-client').addEventListener('click', openCadastroClienteModal);
+    document.getElementById('btn-gerar-proposta').addEventListener('click', handlePropostaSubmit);
+    addPropostaItemRow();
+}
+
+function openCadastroClienteModal() {
+    const modalContent = document.getElementById('modal-content');
+    modalContent.innerHTML = `<div class="p-6"><div class="flex justify-between items-center mb-4"><h3 class="text-xl font-bold text-brand-blue">Cadastrar Novo Cliente</h3><button onclick="openPropostaOrcamentoModal()" class="text-3xl hover:text-red-500">&times;</button></div><form id="cliente-form" class="space-y-4"><div class="grid grid-cols-1 md:grid-cols-2 gap-4"><div><label>Razão Social</label><input type="text" id="cliente-razao-social" required class="w-full mt-1 p-2 border rounded-lg"></div><div><label>CNPJ</label><input type="text" id="cliente-cnpj" class="w-full mt-1 p-2 border rounded-lg"></div></div><div><label>Nome do Contato</label><input type="text" id="cliente-contato" class="w-full mt-1 p-2 border rounded-lg"></div><div class="grid grid-cols-1 md:grid-cols-2 gap-4"><div><label>Celular</label><input type="text" id="cliente-celular" class="w-full mt-1 p-2 border rounded-lg"></div><div><label>E-mail</label><input type="email" id="cliente-email" class="w-full mt-1 p-2 border rounded-lg"></div></div><div class="mt-6 flex justify-end gap-4"><button type="button" onclick="openPropostaOrcamentoModal()" class="bg-gray-200 text-gray-700 font-bold py-2 px-4 rounded-lg">Cancelar</button><button type="submit" class="bg-brand-blue text-white font-bold py-2 px-4 rounded-lg">Salvar Cliente</button></div></form></div>`;
+    document.getElementById('cliente-form').addEventListener('submit', handleClienteSubmit);
+}
+
+function handleClienteSubmit(e) {
+    e.preventDefault();
+    const clientData = {
+        razaoSocial: document.getElementById('cliente-razao-social').value,
+        cnpj: document.getElementById('cliente-cnpj').value,
+        nomeContato: document.getElementById('cliente-contato').value,
+        celular: document.getElementById('cliente-celular').value,
+        email: document.getElementById('cliente-email').value,
+    };
+    if(!clientData.razaoSocial) { showFeedbackModal('error', 'Campo Obrigatório', 'Razão Social é obrigatória.'); return; }
+
+    showProcessingModal('Salvando cliente...');
+    google.script.run.withSuccessHandler(res => {
+        if(res.success) {
+            appDataStore.clientes.push(res.newClient); 
+            showFeedbackModal('success', 'Sucesso!', res.message);
+            openPropostaOrcamentoModal();
+            setTimeout(() => { 
+                const select = document.getElementById('proposta-cliente-select');
+                if (select) select.value = JSON.stringify(res.newClient);
+             }, 100);
+        } else {
+            showFeedbackModal('error', 'Erro', res.message);
+        }
+    }).withFailureHandler(onLoginFailure).addNewCliente(clientData);
+}
+
+function addPropostaItemRow() {
+    const allCargos = [...appDataStore.orcamentoBase, ...appDataStore.baseSalariosConvencao];
+    const uniqueCargos = Array.from(new Map(allCargos.map(item => [item['funcao'], item])).values()).sort((a,b) => a.funcao.localeCompare(b.funcao));
+    const newRow = document.createElement('div');
+    newRow.className = 'grid grid-cols-12 items-center gap-4 py-1 proposta-item-row';
+    const escalas = ['12x36', '6x1', '5x2', '5x1'];
+    newRow.innerHTML = `
+        <div class="col-span-4"><select class="w-full p-1 border rounded-lg text-sm cargo-select"><option value="">Selecione o Cargo...</option>${uniqueCargos.map(c => `<option value="${c.id}">${c.funcao}</option>`).join('')}</select></div>
+        <div class="col-span-2"><select class="w-full p-1 border rounded-lg text-sm escala-select">${escalas.map(e => `<option value="${e}">${e}</option>`).join('')}</select></div>
+        <div class="col-span-1"><input type="number" min="0" value="1" class="w-full p-1 border rounded-lg text-center qtd-input"></div>
+        <div class="col-span-2"><input type="text" class="w-full p-1 border rounded-lg text-sm valor-unitario" value="R$ 0,00"></div>
+        <div class="col-span-3 text-right font-medium text-gray-800 flex items-center justify-end">
+            <span class="total-linha">R$ 0,00</span><button class="text-red-500 hover:text-red-700 ml-2 btn-remove-proposta-row"><i data-lucide="trash-2"></i></button>
+        </div>`;
+    
+    document.getElementById('proposta-items').appendChild(newRow);
+    lucide.createIcons();
+    
+    const valorUnitarioInput = newRow.querySelector('.valor-unitario');
+    const updateHandler = () => {
+        const cargoId = newRow.querySelector('.cargo-select').value;
+        let salario = 0;
+        if(cargoId) {
+            const cargo = allCargos.find(c => c.id === cargoId);
+            salario = cargo ? cargo.salario : 0;
+        }
+        valorUnitarioInput.value = formatToBRL(salario);
+        updatePropostaTotal();
+    };
+    
+    newRow.querySelector('.cargo-select').addEventListener('change', updateHandler);
+    newRow.querySelector('.qtd-input').addEventListener('input', updatePropostaTotal);
+    valorUnitarioInput.addEventListener('input', formatCurrency);
+    valorUnitarioInput.addEventListener('change', updatePropostaTotal);
+    newRow.querySelector('.btn-remove-proposta-row').addEventListener('click', () => { newRow.remove(); updatePropostaTotal(); });
+    updateHandler();
+}
+
+function updatePropostaTotal() {
+    let grandTotal = 0;
+    document.querySelectorAll('.proposta-item-row').forEach(row => {
+        const totalLinha = (parseCurrency(row.querySelector('.valor-unitario').value) || 0) * (parseInt(row.querySelector('.qtd-input').value) || 0);
+        row.querySelector('.total-linha').textContent = formatToBRL(totalLinha);
+        grandTotal += totalLinha;
+    });
+    document.getElementById('proposta-total').textContent = formatToBRL(grandTotal);
+}
+
+function handlePropostaSubmit() {
+    const clienteSelect = document.getElementById('proposta-cliente-select');
+    if(!clienteSelect.value) { showFeedbackModal('error', 'Cliente não selecionado', 'Por favor, selecione um cliente para a proposta.'); return; }
+    const cliente = JSON.parse(clienteSelect.value);
+    const valorTotal = document.getElementById('proposta-total').textContent;
+    const items = Array.from(document.querySelectorAll('.proposta-item-row')).map(row => {
+        const select = row.querySelector('.cargo-select');
+        return {
+            cargo: select.options[select.selectedIndex].text,
+            escala: row.querySelector('.escala-select').value,
+            quantidade: row.querySelector('.qtd-input').value,
+            valorUnitario: row.querySelector('.valor-unitario').value, 
+            totalLinha: row.querySelector('.total-linha').textContent,
+    }}).filter(item => parseInt(item.quantidade) > 0 && item.cargo !== 'Selecione o Cargo...');
+
+    if (items.length === 0) { showFeedbackModal('error', 'Nenhum Item Válido', "Adicione e selecione pelo menos um cargo com quantidade maior que zero."); return; }
+    
+    showProcessingModal('Gerando proposta...');
+    const propostaParaSalvar = { clienteNome: cliente.RAZAO_SOCIAL, valorTotal: parseCurrency(valorTotal), responsavel: currentUser.name };
+    const propostaParaPdf = { cliente, items, total: valorTotal, responsavel: currentUser.name };
+    
+    google.script.run.withSuccessHandler(res => {
+        if (!res.success) { showFeedbackModal('error', 'Erro ao Salvar', res.message); return; }
+        google.script.run.withSuccessHandler(pdfRes => {
+            if (pdfRes.success) {
+                closeModal();
+                showFeedbackModal('success', 'Proposta Gerada', "Sua proposta foi gerada. O download deve iniciar em breve.");
+                window.open(pdfRes.url, '_blank');
+            } else { showFeedbackModal('error', 'Erro no PDF', pdfRes.message); }
+        }).withFailureHandler(onLoginFailure).generatePdfFromTemplate(propostaParaPdf);
+    }).withFailureHandler(onLoginFailure).savePropostaGerada(propostaParaSalvar);
+}
+
+// --- FUNÇÕES UTILITÁRIAS ---
+function formatCurrency(e) { let v = e.target.value.replace(/\D/g, ''); v = (v/100).toLocaleString('pt-BR', {minimumFractionDigits: 2}); e.target.value = "R$ " + v; }
+function parseCurrency(value) { return parseFloat(String(value).replace(/[^0-9,.-]+/g,"").replace(/\./g, "").replace(",", ".")) || 0; }
+function formatToBRL(value) { return (parseFloat(value) || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }); }
+</script>
